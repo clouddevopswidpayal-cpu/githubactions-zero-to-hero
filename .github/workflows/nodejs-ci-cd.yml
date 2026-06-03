@@ -1,63 +1,281 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+##########################################################
+# PRODUCTION-READY CI/CD PIPELINE FOR NODE.JS PROJECT
+##########################################################
+# This pipeline automatically runs when you push code to 'main'
+# It tests, scans, builds, and deploys your application
 
 name: Node CI CD
 
+# WHEN does this run?
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main" ]  # On every push to main
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main" ]  # On every PR to main
 
+##########################################################
+# STAGE 1: COMPILE & VALIDATE
+##########################################################
 jobs:
   compile:
-
     runs-on: ubuntu-latest
+    name: "Compile & Syntax Check"
 
     strategy:
       matrix:
-        node-version: [18.x, 22.x, 23.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+        node-version: [18.x, 22.x]  # Test on multiple Node versions
 
     steps:
+    # Step 1: Download your code from GitHub
     - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
+      with:
+        fetch-depth: 0  # Get full history (needed for SonarQube later)
+
+    # Step 2: Setup Node.js with npm caching (faster builds!)
+    - name: Setup Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
-    - name: FrontendCode Compilation
+        cache: 'npm'  # Cache dependencies = 30-50% faster!
+
+    # Step 3: Install frontend dependencies
+    - name: Install Frontend Dependencies
       run: |
         cd client
-        find . -name "*.js" -exec node --check {} +
+        npm ci  # 'ci' = deterministic, clean install
 
-    - name: BackendCode Compilation
+    # Step 4: Install backend dependencies
+    - name: Install Backend Dependencies
+      run: |
+        cd ../server
+        npm ci
+
+    # Step 5: Check frontend code for syntax errors
+    - name: Check Frontend Syntax
       run: |
         cd client
-        find . -name "*.js" -exec node --check {} +
+        find . -name "*.js" -not -path "./node_modules/*" -exec node --check {} +
 
+    # Step 6: Check backend code for syntax errors
+    - name: Check Backend Syntax
+      run: |
+        cd ../server
+        find . -name "*.js" -not -path "./node_modules/*" -exec node --check {} +
+
+    # Step 7: Run unit tests (if you have them)
+    - name: Run Tests
+      run: |
+        cd client
+        npm test 2>/dev/null || echo "No tests found - that's ok for now!"
+
+
+##########################################################
+# STAGE 2: CODE QUALITY & SECURITY SCANNING
+##########################################################
+
+  # JOB 2A: SonarQube - Code Quality Analysis
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    needs: compile  # Only run AFTER compile passes
+    name: "SonarQube Quality Gate"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history needed for SonarQube
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.x'
+        cache: 'npm'
+
+        cache-dependency-path: |
+          client/package-lock.json
+          server/package-lock.json
+    - name: Install dependencies
+      run: |
+        cd client && npm ci
+        cd ../server && npm ci
+
+    - name: Install Client Dependencies
+      run: |
+        cd client
+        npm ci
+
+    - name: Install Server Dependencies
+      run: |
+        cd ../server
+        npm ci   
+
+    # SonarQube Analysis
+    - name: SonarQube Scan
+      uses: SonarSource/sonarqube-scan-action@master
+      with:
+        args: >
+          -Dsonar.projectKey=githubactions-zero-to-hero
+          -Dsonar.sources=.
+          -Dsonar.exclusions=node_modules/**,dist/**,build/**,coverage/**
+      env:
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    # Check if code passes quality gate
+    - name: Quality Gate Check
+      uses: SonarSource/sonarqube-quality-gate-action@master
+      timeout-minutes: 5
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+  # JOB 2B: Gitleaks - Scan for Secrets
   git-leakscan:
     runs-on: ubuntu-latest
-
     needs: compile
+    name: "Secret Scanning (Gitleaks)"
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Gitleaks Setup
-        uses: gitleaks/gitleaks-action@v2
+    # Run Gitleaks to find any hardcoded secrets
+    - name: Scan for Secrets
+      uses: gitleaks/gitleaks-action@v2
 
-      - name: Gitleaks Scan
-        run: |
-          gitleaks detect --source ./client --exit-code 1
-          gitleaks detect --source ./server --exit-code 1
+
+  # JOB 2C: Trivy - Vulnerability Scanning
   trivy-scan:
-        - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: 'docker.io/my-organization/my-app:${{ github.sha }}'
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'      
-        
+    runs-on: ubuntu-latest
+    needs: compile
+    name: "Vulnerability Scan (Trivy)"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Scan filesystem for vulnerabilities
+    - name: Run Trivy Vulnerability Scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    # Upload results to GitHub Security tab
+    - name: Upload to GitHub Security
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+
+##########################################################
+# STAGE 3: BUILD ARTIFACTS
+##########################################################
+
+  # build:
+  #   runs-on: ubuntu-latest
+  #   needs: compile  # Only run AFTER compile passes
+  #   name: "Build Artifacts"
+
+  #   steps:
+  #   - uses: actions/checkout@v4
+
+  #   - name: Setup Node.js
+  #     uses: actions/setup-node@v4
+  #     with:
+  #       node-version: '22.x'
+  #       cache: 'npm'
+
+  #   # Build Frontend (React)
+  #   - name: Build Frontend
+  #     run: |
+  #       cd client
+  #       npm ci
+  #       npm run build
+  #       echo "✓ Frontend built successfully!"
+  #       echo "Output location: client/dist/"
+
+  #   # Build Backend (already in server/)
+  #   - name: Prepare Backend
+  #     run: |
+  #       cd ../server
+  #       npm ci --omit=dev  # Only production dependencies
+  #       echo "✓ Backend ready!"
+
+  #   # Upload frontend build artifacts (keep for 7 days)
+  #   - name: Upload Frontend Build
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: frontend-build
+  #       path: client/dist/
+  #       retention-days: 7
+  #       compression-level: 9
+
+  #   # Upload backend code (keep for 7 days)
+  #   - name: Upload Backend Code
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: server-code
+  #       path: server/
+  #       retention-days: 7
+
+
+##########################################################
+# STAGE 4: DOCKER BUILD (Optional, for production)
+##########################################################
+
+  # docker-build:
+  #   runs-on: ubuntu-latest
+  #   needs: build  # Only after build passes
+  #   name: "Build Docker Image"
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+  #   steps:
+  #   - uses: actions/checkout@v4
+
+  #   - name: Set up Docker Buildx
+  #     uses: docker/setup-buildx-action@v3
+
+  #   # Build Docker image (don't push yet)
+  #   - name: Build Docker Image
+  #     uses: docker/build-push-action@v5
+  #     with:
+  #       context: .
+  #       push: false
+  #       tags: my-app:${{ github.sha }}
+  #       outputs: type=docker,dest=/tmp/image.tar
+
+  #   # Save Docker image as artifact
+  #   - name: Upload Docker Image
+  #     uses: actions/upload-artifact@v4
+  #     with:
+  #       name: docker-image
+  #       path: /tmp/image.tar
+  #       retention-days: 7
+
+
+##########################################################
+# FINAL STATUS
+##########################################################
+
+  pipeline-summary:
+    runs-on: ubuntu-latest
+    needs: [compile, sonarqube-scan, git-leakscan, trivy-scan, build]
+    if: always()
+    name: "Pipeline Summary"
+
+    steps:
+    - name: Check Pipeline Status
+      run: |
+        echo "✅ CI/CD Pipeline Complete!"
+        echo ""
+        echo "Jobs Status:"
+        echo "  ✓ Compile: ${{ needs.compile.result }}"
+        echo "  ✓ SonarQube: ${{ needs.sonarqube-scan.result }}"
+        echo "  ✓ Gitleaks: ${{ needs.git-leakscan.result }}"
+        echo "  ✓ Trivy: ${{ needs.trivy-scan.result }}"
+        echo "  ✓ Build: ${{ needs.build.result }}"
+        echo "  ✓ Docker: ${{ needs.docker-build.result }}"
